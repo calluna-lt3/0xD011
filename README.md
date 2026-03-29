@@ -1,3 +1,4 @@
+```
 file hosting service because every one i ever use dies
 
 for POST reqs:
@@ -14,3 +15,4 @@ how do we handle page routing?
 * for now just serve files on the paths that match their names, however in the
   future we can do a lookup from path -> hashed filename if we want more
   memorable names
+```
