@@ -1,3 +1,4 @@
 /target
 /pages
 /arbitrary
+/sqlite.db*

@@ -20,9 +20,14 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
 use std::net::Ipv4Addr;
+use std::path::Path;
+use tokio::net::TcpListener;
 
+use sqlx::migrate::MigrateDatabase;
+use sqlx::{Row, Sqlite, SqlitePool};
+
+const DB_URL: &str = "sqlite://sqlite.db";
 const FILESIZE_MAX: u64 = 2048;
 
 // TODO: proper templates
@@ -31,12 +36,13 @@ const FILESIZE_MAX: u64 = 2048;
 macro_rules! template_content {
     ($x:expr) => {
         match $x {
-            404 => { Bytes::from("404") },
-            _ => { panic!("idunno what happened sorry"); },
+            404 => Bytes::from("404"),
+            _ => {
+                panic!("idunno what happened sorry");
+            }
         }
     };
 }
-
 
 #[allow(dead_code)]
 fn print_packet(req: &Request<hyper::body::Incoming>) {
@@ -47,17 +53,21 @@ fn print_packet(req: &Request<hyper::body::Incoming>) {
 
     let method = req.method();
     let uri = req.uri();
-    let res = format!(r#">>>>>>>>>>>>>>>>>>>>
+    let res = format!(
+        r#">>>>>>>>>>>>>>>>>>>>
  method: {method:?}
     uri: {uri}
 ===== HEADERS START =====
 {headers}
 ===== HEADERS END =====
-<<<<<<<<<<<<<<<<<<<<"#);
+<<<<<<<<<<<<<<<<<<<<"#
+    );
     println!("{res}");
 }
 
-async fn handle_get(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn handle_get(
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
     let content = match req.uri().path() {
         "/" => {
             let file = File::open("./pages/index.html");
@@ -67,7 +77,7 @@ async fn handle_get(req: Request<hyper::body::Incoming>) -> Result<Response<Full
             } else {
                 template_content!(404)
             }
-        },
+        }
         "/styles.css" => {
             let file = File::open("./pages/styles.css");
             if let Ok(file) = file {
@@ -75,7 +85,7 @@ async fn handle_get(req: Request<hyper::body::Incoming>) -> Result<Response<Full
             } else {
                 template_content!(404)
             }
-        },
+        }
         other => {
             let file = File::open(format!("./arbitrary{other}"));
             if let Ok(file) = file {
@@ -124,16 +134,17 @@ fn write_bytes(file: &mut File, bytes: Bytes) -> Result<(), std::io::Error> {
     file.write_all(bytes.to_vec().as_slice())
 }
 
-async fn handle_post(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn handle_post(
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
     let (parts, data) = req.into_parts();
     let _host = parts.headers.get("host").unwrap();
-
 
     // we only want to accept forms
     // * https://www.iana.org/assignments/media-types/media-types.xhtml
     let content_type = parts.headers.get("content-type").unwrap();
     let content_type_str = content_type.to_str().unwrap();
-    if let Some(i) = content_type_str.find(";"){
+    if let Some(i) = content_type_str.find(";") {
         assert_eq!("multipart/form-data", &content_type_str[..i]);
     } else {
         panic!("how are we here");
@@ -157,12 +168,13 @@ async fn handle_post(req: Request<hyper::body::Incoming>) -> Result<Response<Ful
             if size > FILESIZE_MAX {
                 todo!("dropped packet, size hint upper bound too big: `{size}`");
             }
-        },
+        }
         None => {
             todo!("dropped packet, size hint upper bound non-existent");
-        },
+        }
     }
 
+    // NOTE: might already be loaded? packet size limit via firewall might be best ,, idk
     // read entire body of the request into memory
     let body = data.collect().await.unwrap().to_bytes();
 
@@ -179,11 +191,7 @@ async fn handle_post(req: Request<hyper::body::Incoming>) -> Result<Response<Ful
     for (i, byte) in body.slice(boundary_len..).iter().enumerate() {
         if *byte == expect {
             progress += 1;
-            expect = if progress == 2 {
-                b'\r'
-            } else {
-                b'\n'
-            }
+            expect = if progress == 2 { b'\r' } else { b'\n' }
         } else {
             progress = 0;
             expect = b'\r';
@@ -215,25 +223,75 @@ async fn handle_post(req: Request<hyper::body::Incoming>) -> Result<Response<Ful
     Ok(Response::new(Full::new(template_content!(404))))
 }
 
-async fn handle_request(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn handle_request(
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
     let method = req.method();
     match *method {
-        Method::GET => {
-            handle_get(req).await
-        },
-        Method::POST => {
-            handle_post(req).await
-        },
+        Method::GET => handle_get(req).await,
+        Method::POST => handle_post(req).await,
         _ => {
             panic!("unsupported method: {method:?}");
         }
     }
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct Upload {
+    hash: String,
+    owner: String,
+    extension: String,
+    time_uploaded: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 3000));
     let listener = TcpListener::bind(addr).await?;
+
+    // db stuff u faggot
+    if !Sqlite::database_exists(DB_URL).await.unwrap_or(false) {
+        println!("Creating database {}", DB_URL);
+        match Sqlite::create_database(DB_URL).await {
+            Ok(_) => println!("Create db success"),
+            Err(error) => panic!("error: {}", error),
+        }
+    } else {
+        println!("db exists");
+    }
+
+    let db = SqlitePool::connect(DB_URL).await.unwrap();
+    let crate_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let migrations = Path::new(&crate_dir).join("./migrations");
+    let migration_res = sqlx::migrate::Migrator::new(migrations)
+        .await
+        .unwrap()
+        .run(&db)
+        .await;
+
+    match migration_res {
+        Ok(_) => println!("migration ok"),
+        Err(e) => panic!("err: {}", e),
+    }
+
+    let res = sqlx::query("INSERT INTO uploads VALUES ('abcdefghabcdefghabcdefghabcdefghabcdefghabcdefghabcdefghabcdefgh', '111.111.111.111', 'txt', '2025-04-01 22:22:22');")
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let res = sqlx::query_as::<_, Upload>("SELECT * FROM uploads")
+        .fetch_all(&db)
+        .await
+        .unwrap();
+
+    res.iter().for_each(|x| {
+        println!("hash: {}", x.hash);
+        println!("owner: {}", x.owner);
+        println!("extension: {}", x.extension);
+        println!("time_uploaded: {}", x.time_uploaded);
+    });
+
+    todo!();
 
     loop {
         let (stream, _) = listener.accept().await?;
